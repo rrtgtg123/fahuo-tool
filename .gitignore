@@ -1,0 +1,26 @@
+# Build output
+dist/
+build/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# WorkBuddy workspace data
+.workbuddy/
+
+# Local config (user-specific paths)
+config.local.json
