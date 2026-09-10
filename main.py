@@ -521,7 +521,7 @@ def main():
     if last_tpl and not os.path.isfile(last_tpl):
         last_tpl = ""
 
-    window = sg.Window("发货数据填入工具 v2.0", make_layout(last_tpl),
+    window = sg.Window("发货数据填入工具 v2.1", make_layout(last_tpl),
                        size=(win_w, win_h), resizable=True, finalize=True)
     window.set_min_size((660, 480))
     if last_tpl:
@@ -657,10 +657,18 @@ def main():
         refresh_preview(raw)
         set_status(f"AI 已拆 {len(rows)} 条", OK)
 
-        rule_desc = (f"分行：{_resolve_line_text(ai_split._resolve_line_sep(rule['line_sep']))}"
+        if rule.get("line_sep_re"):
+            line_desc = "正则模式（见日志）"
+        else:
+            line_desc = _resolve_line_text(ai_split._resolve_line_sep(rule["line_sep"]))
+        rule_desc = (f"分行：{line_desc}"
                      f" · 分列：{_resolve_sep_text(ai_split._resolve_sep(rule['split_by']))}"
                      f" · 列序：{'/'.join(rule['columns'])}")
         log(f"[AI] {rule_desc}")
+        if rule.get("line_sep_re"):
+            log(f"[AI] 分条正则：{rule['line_sep_re']}")
+        if rule.get("strip_prefix"):
+            log(f"[AI] 剔除前缀：{rule['strip_prefix']}")
         if rule["reason"]:
             log(f"[AI] 依据：{rule['reason']}（把握 {rule['confidence']:.0%}）")
         no_phone = sum(1 for r in rows if not r["手机"])

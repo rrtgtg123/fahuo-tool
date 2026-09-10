@@ -62,19 +62,37 @@ SYSTEM_PROMPT = """你是一个数据格式分析助手。用户会给你一段�
   绝大多数情况是「收件人 手机号 地址」。
   如果手机号在第一位，或地址在中间，要用 columns 字段说明真实顺序。
 
+【第三步】有没有需要剔除的噪音前缀？
+  很多数据是从聊天记录、导出表格里粘出来的，每条记录开头会带一段固定格式的垃圾：
+  - "小八: 09-07 16:38:04 张三，138..."    → 开头是「昵称: 日期 时间 」
+  - "1. 李四 139..."                        → 开头是「序号. 」
+  - "[2024-01-01 10:00] 王五 137..."        → 开头是「[时间] 」
+  - "订单号12345 赵六 136..."               → 开头是「订单号+数字 」
+  这类噪音必须先用 strip_prefix 正则剔除，否则会被当成收件人名字的一部分。
+
+  注意：如果每条记录的开头都带同一段格式（如「昵称: 时间」），说明这个特征本身
+  也可以当作记录分隔符 —— 此时 line_sep_re 用这个模式切分，strip_prefix 再用它剥掉。
+
 严格只输出一个 JSON 对象，不要任何解释文字、不要 markdown 代码块。格式：
 
 {
   "line_sep": "\\n",
+  "line_sep_re": "",
   "split_by": "空格",
+  "strip_prefix": "",
   "columns": ["收件人", "手机", "地址"],
   "confidence": 0.9,
   "reason": "一句话说明你的判断依据"
 }
 
 字段约束：
-- line_sep：记录之间的分隔符，用转义写法。可选 "\\n"、"\\n\\n"、";"、"|"、"\\t\\t" 等。
+- line_sep：记录之间的固定分隔符，用转义写法。可选 "\\n"、"\\n\\n"、";"、"|"、"\\t\\t" 等。
+- line_sep_re：当记录分隔符不是固定字符串、而是一个【正则模式】时填这里（line_sep 留空）。
+  例如聊天记录格式用 "(?m)^小八[:：]\\s*\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}\\s*"，序号格式用 "(?m)^\\d+[.、]\\s*"。
+  没有这种模式就填空字符串 ""。填写时必须用标准 Python 正则语法。
 - split_by：列之间的分隔符。可选 "空格"、"\\t"、","、"|"、"无" 等。
+- strip_prefix：每条记录开头要剔除的噪音正则，没有就填空字符串 ""。
+  例："(?m)^\\S{0,4}[:：]\\s*\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}\\s*" 可去掉「小八: 09-07 16:38:04 」。
 - columns：长度必须是 3，元素从 ["收件人", "手机", "地址"] 中取，代表三段内容依次对应哪一列。
 - confidence：0 到 1 的小数，你对这次判断的把握。
 - reason：不超过 40 字的中文说明。"""
@@ -88,7 +106,9 @@ USER_PROMPT_TEMPLATE = """请分析下面这段数据，给出分行规则和分
 注意：
 1. 如果数据超过 20 条，上面只截取了前 20 条，按这个样本判断规则即可。
 2. 地址中可能包含空格、逗号等字符，判断分隔符时要选真正稳定的那个。
-3. 严格只输出 JSON。"""
+3. 若每条记录开头有一段重复出现的噪音（昵称、时间戳、序号等），务必填 strip_prefix 剔除。
+4. 若整段数据里根本没有换行、全靠某个特征分条（如「小八: 时间」），用 line_sep_re 写这个正则。
+5. 严格只输出 JSON。"""
 
 
 # ---------------- 异常 ----------------
@@ -191,6 +211,17 @@ def build_sample(raw: str, max_lines: int = 20, max_chars: int = 3000) -> str:
 
 # ---------------- 主入口：让模型给出拆分参数 ----------------
 VALID_COLUMNS = ("收件人", "手机", "地址")
+
+
+def _valid_re(pattern: str) -> bool:
+    """校验正则是否合法（防止模型给出坏正则导致整条链路崩掉）。"""
+    try:
+        re.compile(pattern)
+        return True
+    except re.error:
+        return False
+
+
 # 模型可能返回的各种别名，统一映射到内部列名
 _COLUMN_ALIAS = {
     "收件人": "收件人", "姓名": "收件人", "名字": "收件人", "收货人": "收件人",
@@ -210,9 +241,28 @@ def normalize_rule(data: dict) -> dict:
     if not isinstance(line_sep, str) or line_sep == "":
         line_sep = "\n"
 
+    # 记录分隔符的正则模式（优先于 line_sep），非法正则直接丢弃
+    line_sep_re = data.get("line_sep_re", "") or ""
+    if not isinstance(line_sep_re, str):
+        line_sep_re = ""
+    line_sep_re = line_sep_re.strip()
+    if line_sep_re and not _valid_re(line_sep_re):
+        line_sep_re = ""
+
     split_by = data.get("split_by", "空格")
     if not isinstance(split_by, str) or not split_by:
         split_by = "空格"
+
+    # 每条记录开头要剔除的噪音正则
+    strip_prefix = data.get("strip_prefix", "") or ""
+    if not isinstance(strip_prefix, str):
+        strip_prefix = ""
+    strip_prefix = strip_prefix.strip()
+    if strip_prefix and not _valid_re(strip_prefix):
+        strip_prefix = ""
+
+    if line_sep_re:
+        line_sep = "\n"  # 用正则分条时，line_sep 不再参与
 
     cols = data.get("columns", ["收件人", "手机", "地址"])
     if not isinstance(cols, list) or len(cols) != 3:
@@ -232,7 +282,8 @@ def normalize_rule(data: dict) -> dict:
     confidence = min(max(confidence, 0.0), 1.0)
 
     reason = str(data.get("reason", "") or "")[:80]
-    return {"line_sep": line_sep, "split_by": split_by,
+    return {"line_sep": line_sep, "line_sep_re": line_sep_re,
+            "split_by": split_by, "strip_prefix": strip_prefix,
             "columns": normed, "confidence": confidence, "reason": reason}
 
 
@@ -346,22 +397,45 @@ def _fallback_by_phone(line: str) -> dict:
 
 
 def apply_rule(raw: str, rule: dict) -> list:
-    """接收模型给出的两个参数（line_sep / split_by），生成拆好的数据列表。
+    """用模型给出的参数生成拆好的数据列表。
+
+    参数（全部来自模型，见 normalize_rule）：
+      line_sep      记录之间的固定分隔符，如 "\\n"、";"
+      line_sep_re   记录分隔的【正则模式】，非空时优先于 line_sep
+                    （用于「小八: 09-07 16:38:04 」这类特征分条）
+      split_by      三列之间的分隔符，如 "空格"、"，"
+      strip_prefix  每条记录开头要剔除的噪音正则
+      columns       三段内容依次对应哪一列（处理列序颠倒）
 
     返回 [{"收件人": ..., "手机": ..., "地址和品类及数量": ...}, ...]
     与 parse_text() 的输出结构完全一致，可直接喂给 write_excel()。
     """
     text = (raw or "").replace("\r\n", "\n").replace("\r", "\n")
     line_sep = _resolve_line_sep(rule.get("line_sep", "\n"))
+    line_sep_re = (rule.get("line_sep_re") or "").strip()
+    strip_prefix = (rule.get("strip_prefix") or "").strip()
     sep = _resolve_sep(rule.get("split_by", "空格"))
     cols = rule.get("columns") or ["收件人", "手机", "地址"]
 
-    records = text.split(line_sep) if line_sep else [text]
+    # 分条：优先用正则模式，其次固定分隔符
+    if line_sep_re and _valid_re(line_sep_re):
+        parts = re.split(line_sep_re, text)
+        # 正则分条时，前缀其实就是分隔特征本身，剥掉它
+        if not strip_prefix:
+            strip_prefix = line_sep_re
+    else:
+        parts = text.split(line_sep) if line_sep else [text]
+
+    prefix_re = re.compile(strip_prefix) if strip_prefix and _valid_re(strip_prefix) else None
+
     rows = []
-    for rec in records:
+    for rec in parts:
         # 一条记录内部若还有换行（如地址换行），拉平成空格，避免写进单元格带换行符
         rec = rec.replace("\r", " ").replace("\n", " ").strip()
         rec = re.sub(r"[ \t]{2,}", " ", rec)
+        if prefix_re:                      # 剔除开头的噪音（昵称/时间戳/序号等）
+            rec = prefix_re.sub("", rec, count=1).strip()
+            rec = re.sub(r"^[ \t，,;；、:：]+", "", rec)   # 剥完可能残留的分隔符
         if not rec:
             continue
         row = _split_columns(rec, sep, cols)
