@@ -14,6 +14,8 @@ import zipfile
 import openpyxl
 import PySimpleGUI as sg
 
+import ai_split
+
 # ---------------- 解析规则 ----------------
 # 手机号：11 位，或以“-”连接 4 位短号的虚拟号码
 PHONE_RE = re.compile(r"1[3-9]\d{9}(?:-\d{4})?")
@@ -282,6 +284,61 @@ def install_log_hover(window, get_history, width=110, height=12, idle_ms=500):
     return top
 
 
+def ai_settings_dialog(parent, cfg: dict) -> dict:
+    """AI 设置弹窗：填 OpenAI 兼容的接口地址 / API Key / 模型名。
+
+    返回新的配置 dict；用户取消则原样返回传入的 cfg。
+    """
+    layout = [
+        [sg.Text("接口地址", size=(9, 1)),
+         sg.Input(cfg.get("base_url", ""), key="-URL-", expand_x=True, size=(46, 1)),
+         sg.Text("OpenAI 兼容，形如 https://api.deepseek.com/v1", font=F_SMALL,
+                 text_color=MUTED)],
+        [sg.Text("API Key", size=(9, 1)),
+         sg.Input(cfg.get("api_key", ""), key="-KEY-", expand_x=True,
+                  password_char="*", size=(46, 1)),
+         sg.Text("本地模型（Ollama 等）可留空", font=F_SMALL, text_color=MUTED)],
+        [sg.Text("模型名", size=(9, 1)),
+         sg.Input(cfg.get("model", ai_split.DEFAULT_MODEL), key="-MODEL-",
+                  expand_x=True, size=(46, 1)),
+         sg.Text("例：gpt-4o-mini / deepseek-chat / qwen-plus", font=F_SMALL,
+                 text_color=MUTED)],
+        [sg.Text("", font=F_SMALL, text_color=MUTED, expand_x=True)],
+        [sg.Column([[
+            sg.Button("保存", key="-SAVE-", size=(10, 1), font=F_BTN, border_width=0,
+                      button_color=BTN_PRIMARY, mouseover_colors=BTN_PRIMARY_HOVER),
+            sg.Button("取消", key="-CANCEL-", size=(10, 1), border_width=0,
+                      button_color=BTN_SECONDARY, mouseover_colors=BTN_SECONDARY_HOVER),
+        ]], element_justification="center", expand_x=True, pad=(0, (4, 4)))],
+    ]
+    win = sg.Window("AI 分词设置", layout, modal=True, keep_on_top=True,
+                    finalize=True, disable_minimize=True, font=F_BODY)
+    win["-URL-"].set_focus()
+    result = cfg
+    while True:
+        ev, vals = win.read()
+        if ev in (sg.WIN_CLOSED, "-CANCEL-", "取消"):
+            break
+        if ev in ("-SAVE-", "保存"):
+            result = {"base_url": vals["-URL-"].strip(),
+                      "api_key": vals["-KEY-"].strip(),
+                      "model": vals["-MODEL-"].strip() or ai_split.DEFAULT_MODEL}
+            break
+    win.close()
+    return result
+
+
+def _resolve_sep_text(split_by: str) -> str:
+    """分隔符转成肉眼可读的展示文字。"""
+    m = {" ": "空格", "\t": "Tab", "": "无（按手机号切）"}
+    return m.get(split_by, f"“{split_by}”")
+
+
+def _resolve_line_text(line_sep: str) -> str:
+    m = {"\n": "换行", "\n\n": "空行", "\t\t": "双 Tab"}
+    return m.get(line_sep, f"“{line_sep}”")
+
+
 def human_error(e: Exception) -> str:
     """把常见异常翻译成人话 + 给出解决办法。"""
     s = str(e)
@@ -338,6 +395,26 @@ def remember_template(path: str):
     save_config(cfg)
 
 
+def load_ai_config() -> dict:
+    """读取 AI 接口配置（地址 / Key / 模型），缺项用默认值补齐。"""
+    cfg = load_config().get("ai", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return {
+        "base_url": cfg.get("base_url", ai_split.DEFAULT_BASE_URL) or "",
+        "api_key": cfg.get("api_key", ai_split.DEFAULT_API_KEY) or "",
+        "model": cfg.get("model", ai_split.DEFAULT_MODEL) or ai_split.DEFAULT_MODEL,
+    }
+
+
+def save_ai_config(base_url: str, api_key: str, model: str):
+    cfg = load_config()
+    cfg["ai"] = {"base_url": (base_url or "").strip(),
+                 "api_key": (api_key or "").strip(),
+                 "model": (model or "").strip() or ai_split.DEFAULT_MODEL}
+    save_config(cfg)
+
+
 def template_ext(path: str) -> str:
     """输出文件的后缀跟随模板，兜底 .xlsx。"""
     ext = os.path.splitext(path or "")[1]
@@ -388,6 +465,8 @@ def make_layout(template: str = "") -> list:
                       enable_events=True, border_width=1, right_click_menu=RC_MENU,
                       tooltip="每行一条：收件人 手机号 地址和品类及数量（支持右键粘贴）")],
         [sg.Text("", key="-COUNT-", font=F_SMALL, text_color=TEXT, expand_x=True),
+         secondary_btn("AI 分词", "-AISPLIT-", size=(10, 1)),
+         secondary_btn("AI 设置", "-AICFG-", size=(10, 1)),
          secondary_btn("从剪贴板粘贴", "-PASTE-", size=(14, 1)),
          secondary_btn("清空", "-CLEAR-", size=(8, 1))],
     ]
@@ -442,7 +521,7 @@ def main():
     if last_tpl and not os.path.isfile(last_tpl):
         last_tpl = ""
 
-    window = sg.Window("发货数据填入工具 v1.9", make_layout(last_tpl),
+    window = sg.Window("发货数据填入工具 v2.0", make_layout(last_tpl),
                        size=(win_w, win_h), resizable=True, finalize=True)
     window.set_min_size((660, 480))
     if last_tpl:
@@ -454,6 +533,9 @@ def main():
     install_autohide_scrollbars(window["-DATA-"])
 
     log_history = []
+
+    # AI 分词状态：active 为 True 时预览/生成都用 AI 拆出来的行
+    ai_state = {"active": False, "rows": [], "rule": None}
 
     def log(msg: str):
         log_history.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -510,7 +592,7 @@ def main():
             window.TKroot.clipboard_append(sel)
 
     def refresh_preview(raw: str) -> list:
-        rows = parse_text(raw)
+        rows = ai_state["rows"] if ai_state["active"] else parse_text(raw)
         shown = rows[:PREVIEW_LIMIT]
         window["-TABLE-"].update([[r[h] for h in HEADERS] for r in shown])
         no_phone = sum(1 for r in rows if not r["手机"])
@@ -518,12 +600,78 @@ def main():
             window["-COUNT-"].update("")
         else:
             tip = f"共 {len(rows)} 条"
+            if ai_state["active"]:
+                tip += " · AI 分词"
             if no_phone:
                 tip += f" · {no_phone} 条未识别手机号"
             if len(rows) > PREVIEW_LIMIT:
                 tip += f" · 预览前 {PREVIEW_LIMIT} 条"
             window["-COUNT-"].update(tip)
         return rows
+
+    def run_ai_split():
+        """调模型拿拆分规则，按规则重切数据并覆盖预览。"""
+        raw = current_text()
+        if not raw.strip():
+            err_popup("还没有数据。\n\n请先在『待处理数据』框中粘贴内容，再点『AI 分词』。")
+            return
+        cfg = load_ai_config()
+        if not cfg["base_url"]:
+            err_popup("还没配置 AI 接口。\n\n点击『AI 设置』，填入 OpenAI 兼容的接口地址"
+                      "（例如 https://api.deepseek.com/v1）和 API Key。")
+            return
+
+        set_status("AI 分析中…", TEXT)
+        window["-AISPLIT-"].update(disabled=True)
+        window["-BAR-"].update(0, visible=True)
+        window.refresh()
+        try:
+            rows, rule = ai_split.split_with_ai(
+                raw, cfg["base_url"], cfg["api_key"], cfg["model"])
+        except ai_split.AIError as e:
+            window["-BAR-"].update(visible=False)
+            window["-AISPLIT-"].update(disabled=False)
+            set_status("AI 分词失败", WARN)
+            log(f"[AI失败] {e}")
+            err_popup(str(e))
+            return
+        except Exception as e:  # 兜底，不让异常炸掉窗口
+            window["-BAR-"].update(visible=False)
+            window["-AISPLIT-"].update(disabled=False)
+            set_status("AI 分词失败", WARN)
+            log(f"[AI失败] {human_error(e)}")
+            err_popup(human_error(e))
+            return
+        window["-BAR-"].update(100, visible=False)
+        window["-AISPLIT-"].update(disabled=False)
+
+        if not rows:
+            set_status("AI 未拆出数据", WARN)
+            log("[AI提示] 按模型给的规则没有拆出任何数据，请检查原始文本。")
+            err_popup("按模型给出的规则没有拆出任何数据。\n\n请确认粘贴的内容是否为收货人数据。")
+            return
+
+        ai_state["active"] = True
+        ai_state["rows"] = rows
+        ai_state["rule"] = rule
+        refresh_preview(raw)
+        set_status(f"AI 已拆 {len(rows)} 条", OK)
+
+        rule_desc = (f"分行：{_resolve_line_text(ai_split._resolve_line_sep(rule['line_sep']))}"
+                     f" · 分列：{_resolve_sep_text(ai_split._resolve_sep(rule['split_by']))}"
+                     f" · 列序：{'/'.join(rule['columns'])}")
+        log(f"[AI] {rule_desc}")
+        if rule["reason"]:
+            log(f"[AI] 依据：{rule['reason']}（把握 {rule['confidence']:.0%}）")
+        no_phone = sum(1 for r in rows if not r["手机"])
+        if no_phone:
+            log(f"[AI提示] 其中 {no_phone} 条未识别到手机号，请人工核对。")
+
+        info_popup(f"已用 AI 规则重新拆分，共 {len(rows)} 条。\n\n"
+                   f"{rule_desc}\n\n"
+                   f"判断依据：{rule['reason'] or '—'}\n"
+                   f"（把握 {rule['confidence']:.0%}）\n\n"
+                   f"可直接点『生成 Excel』，或继续修改文本后自动恢复本地解析。", title="AI 分词完成")
 
     log("就绪。粘贴数据（Ctrl+V 或右键菜单），确认预览无误后生成 Excel。")
     if last_tpl:
@@ -534,8 +682,13 @@ def main():
         if event in (sg.WIN_CLOSED, "-EXIT-"):
             break
 
-        # 文本框内容变化 → 实时刷新预览
+        # 文本框内容变化 → 实时刷新预览（手动改动即放弃 AI 结果，回到本地解析）
         if event == "-DATA-":
+            if ai_state["active"]:
+                ai_state["active"] = False
+                ai_state["rows"] = []
+                ai_state["rule"] = None
+                log("[提示] 文本已修改，恢复本地解析规则。可再次点『AI 分词』。")
             rows = refresh_preview(values["-DATA-"])
             set_status(f"待处理 {len(rows)} 条" if rows else "")
             continue
@@ -564,6 +717,17 @@ def main():
 
         if event == "-PASTE-":
             paste_from_clipboard()
+            continue
+
+        if event == "-AISPLIT-":
+            run_ai_split()
+            continue
+
+        if event == "-AICFG-":
+            new_cfg = ai_settings_dialog(window, load_ai_config())
+            save_ai_config(new_cfg["base_url"], new_cfg["api_key"], new_cfg["model"])
+            log(f"[AI设置] 已保存：{new_cfg['base_url'] or '（未填地址）'} · "
+                f"{new_cfg['model']}")
             continue
 
         if event == "-CLEAR-":
@@ -595,7 +759,7 @@ def main():
 
             remember_template(tpl)  # 生成成功前再记一次，覆盖手动输入路径的情况
 
-            rows = parse_text(values["-DATA-"])
+            rows = ai_state["rows"] if ai_state["active"] else parse_text(values["-DATA-"])
             if not rows:
                 set_status("没有数据", WARN)
                 err_popup("还没有数据。\n\n请先在『待处理数据』框中粘贴内容（每行一条），确认预览无误后再生成。")
