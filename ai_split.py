@@ -88,11 +88,16 @@ SYSTEM_PROMPT = """你是一个数据格式分析助手。用户会给你一段�
 字段约束：
 - line_sep：记录之间的固定分隔符，用转义写法。可选 "\\n"、"\\n\\n"、";"、"|"、"\\t\\t" 等。
 - line_sep_re：当记录分隔符不是固定字符串、而是一个【正则模式】时填这里（line_sep 留空）。
-  例如聊天记录格式用 "(?m)^小八[:：]\\s*\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}\\s*"，序号格式用 "(?m)^\\d+[.、]\\s*"。
+  例如聊天记录格式用 "小八[:：]\\s*\\d{1,2}[-/.]\\d{1,2}\\s+\\d{1,2}[:：]\\d{2}[:：]\\d{2}\\s*"，
+  序号格式用 "\\d+[.、]\\s*"。
+  ★★ 千万不要在开头加 ^ 或 (?m)^ ！！★★
+     本条数据很可能是「一整段、中间没有任何换行」的聊天记录，此时 ^ 只能匹配整段开头，
+     会退化成只切出 1 条。除非你确认数据本身用换行分隔，否则一律不加锚点。
   没有这种模式就填空字符串 ""。填写时必须用标准 Python 正则语法。
 - split_by：列之间的分隔符。可选 "空格"、"\\t"、","、"|"、"无" 等。
 - strip_prefix：每条记录开头要剔除的噪音正则，没有就填空字符串 ""。
-  例："(?m)^\\S{0,4}[:：]\\s*\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}\\s*" 可去掉「小八: 09-07 16:38:04 」。
+  例："\\S{0,4}[:：]\\s*\\d{1,2}[-/.]\\d{1,2}\\s+\\d{1,2}[:：]\\d{2}[:：]\\d{2}\\s*" 可去掉「小八: 09-07 16:38:04 」。
+  同样不要加 ^ 锚点。
 - columns：长度必须是 3，元素从 ["收件人", "手机", "地址"] 中取，代表三段内容依次对应哪一列。
 - confidence：0 到 1 的小数，你对这次判断的把握。
 - reason：不超过 40 字的中文说明。"""
@@ -108,6 +113,7 @@ USER_PROMPT_TEMPLATE = """请分析下面这段数据，给出分行规则和分
 2. 地址中可能包含空格、逗号等字符，判断分隔符时要选真正稳定的那个。
 3. 若每条记录开头有一段重复出现的噪音（昵称、时间戳、序号等），务必填 strip_prefix 剔除。
 4. 若整段数据里根本没有换行、全靠某个特征分条（如「小八: 时间」），用 line_sep_re 写这个正则。
+   ★ 此时正则【绝不能】以 ^ 或 (?m)^ 开头 —— 整段只有一行，^ 只会匹配开头一次，导致分不出条。
 5. 严格只输出 JSON。"""
 
 
@@ -198,15 +204,29 @@ def _extract_json(text: str) -> dict:
 
 # ---------------- 第一步：取样本 ----------------
 def build_sample(raw: str, max_lines: int = 20, max_chars: int = 3000) -> str:
-    """截取前若干行作为分析样本，避免 token 浪费。"""
+    """截取前若干行作为分析样本，避免 token 浪费。
+
+    会在样本前附一行【原始文本结构】说明（总行数 / 总长度），
+    因为「整段只有一行」这个事实对判断分条方式至关重要 ——
+    模型看不见换行符，光看样本内容容易误以为有换行而给出带 ^ 的正则。
+    """
     text = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
         raise AIError("待处理数据是空的，请先粘贴内容。")
+    n_lines = text.count("\n") + 1
     lines = text.split("\n")[:max_lines]
     sample = "\n".join(lines)
     if len(sample) > max_chars:
         sample = sample[:max_chars]
-    return sample
+
+    if n_lines == 1:
+        head = (f"【原始文本结构】整段共 1 行（中间没有任何换行符），"
+                f"总长度 {len(text)} 字符。多条记录挤在同一行里，必须靠某个重复出现的"
+                f"特征来分条，不能用换行符分行、正则里也不能加 ^ 锚点。\n")
+    else:
+        head = (f"【原始文本结构】共 {n_lines} 行"
+                f"（样本展示前 {min(n_lines, len(lines))} 行）。\n")
+    return head + sample
 
 
 # ---------------- 主入口：让模型给出拆分参数 ----------------
@@ -220,6 +240,54 @@ def _valid_re(pattern: str) -> bool:
         return True
     except re.error:
         return False
+
+
+# 行首锚点：(?m)、(?im) 这类内联标志 + "^\s*"，或裸的 "^\s*"
+_LEADING_ANCHOR_RE = re.compile(
+    r"^\s*\(\?[a-zA-Z]*m[a-zA-Z]*\)\s*\^"   # (?m)^  /  (?im)^
+    r"|^\s*\^"                               # 裸 ^
+)
+
+
+def _strip_line_anchor(pattern: str) -> str:
+    """去掉正则开头的行首锚点（^ / (?m)^）。
+
+    为什么必须去：用户粘贴的聊天记录常常是【一整段、中间没有换行】，
+    此时多行模式下 ^ 只匹配整段开头一次，分条会退化成 1 条。
+    模型很容易照搬教科书写法加 (?m)^，这里做一层容错。
+    """
+    if not pattern:
+        return pattern
+    new = _LEADING_ANCHOR_RE.sub("", pattern.lstrip(), count=1)
+    return new.lstrip()
+
+
+def _split_by_re(pattern: str, text: str) -> list:
+    """按正则在 text 上分条；若结果太少且有行首锚点，自动去掉锚点重试。
+
+    两类常见失败：
+      1) 整段无换行 + (?m)^ 锚点  → 只切出 1 段
+      2) 锚点写死导致跨行匹配不上
+    只要能靠去掉锚点救回来，就用救回来的结果。
+    """
+    try:
+        parts = re.split(pattern, text)
+    except re.error:
+        return [text]
+
+    # 分成 2 段以上认为成功；只有 1 段说明正则几乎没匹配上
+    if len(parts) >= 2:
+        return parts
+
+    stripped = _strip_line_anchor(pattern)
+    if stripped and stripped != pattern and _valid_re(stripped):
+        try:
+            parts2 = re.split(stripped, text)
+            if len(parts2) >= 2:
+                return parts2
+        except re.error:
+            pass
+    return parts
 
 
 # 模型可能返回的各种别名，统一映射到内部列名
@@ -463,7 +531,7 @@ def apply_rule(raw: str, rule: dict) -> list:
 
     # 分条：优先用正则模式，其次固定分隔符
     if line_sep_re and _valid_re(line_sep_re):
-        parts = re.split(line_sep_re, text)
+        parts = _split_by_re(line_sep_re, text)
         # 正则分条时，前缀其实就是分隔特征本身，剥掉它
         if not strip_prefix:
             strip_prefix = line_sep_re

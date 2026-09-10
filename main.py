@@ -521,7 +521,7 @@ def main():
     if last_tpl and not os.path.isfile(last_tpl):
         last_tpl = ""
 
-    window = sg.Window("发货数据填入工具 v2.2", make_layout(last_tpl),
+    window = sg.Window("发货数据填入工具 v2.3", make_layout(last_tpl),
                        size=(win_w, win_h), resizable=True, finalize=True)
     window.set_min_size((660, 480))
     if last_tpl:
