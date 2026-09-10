@@ -396,6 +396,50 @@ def _fallback_by_phone(line: str) -> dict:
     }
 
 
+# ---- 收件人专用清洗 ----
+# 聊天记录/导出表格的噪音前缀特征：昵称 + 冒号 + 日期时间。
+# 与具体昵称无关，所以即使模型给的前缀正则带上「小八」这种字面量、
+# 或第一条数据被截断（「八:」缺了字），这里仍能兜住。
+_NOISE_DATE_RE = re.compile(
+    r"^(?:[^\s:：]{0,6}\s*[:：]\s*)?"            # 可选：昵称 + 冒号（「小八:」「八:」）
+    r"\[?\d{1,4}[-/.]\d{1,2}(?:[-/.]\d{1,4})?"   # 日期：09-07 / 2024-01-01 / 09/07/26
+    r"(?:[ T]\d{1,2}[:：]\d{2}(?:[:：]\d{2})?)?"  # 可选时间：16:38 或 16:38:04
+    r"\]?\s*"                                     # 可选的收尾方括号
+)
+# 纯序号 / 订单号前缀：「1. 」「1、」「第3条 」「订单号12345 」
+_NOISE_INDEX_RE = re.compile(
+    r"^(?:第\s*\d+\s*[条个]?\s*[.、)）]?\s*"      # 第3条 / 第3个 / 第3.
+    r"|\d+\s*[.、)）]\s*"                          # 1. / 1、 / 1)
+    r"|订单号\s*\S*\s*"                            # 订单号12345
+    r")"
+)
+
+
+def clean_name(name: str) -> str:
+    """清洗收件人字段：剥掉残留的噪音前缀与杂散符号。
+
+    做两轮：先试模型给的正则（若提供），再用通用模式兜底。
+    通用模式不依赖具体昵称，因此能处理「八:」这类被截断的残缺前缀。
+    """
+    if not name:
+        return ""
+    s = name.strip()
+    # 反复剥，直到不再变化（最多 3 轮，防止死循环）
+    for _ in range(3):
+        before = s
+        s = _NOISE_DATE_RE.sub("", s).strip()
+        s = _NOISE_INDEX_RE.sub("", s).strip()
+        # 剥完可能残留纯符号
+        s = re.sub(r"^[ \t，,;；、:：\-—]+", "", s)
+        s = s.strip()
+        if s == before:
+            break
+    # 整段只剩符号或数字时间（说明原本就没有名字），返回空
+    if not s or re.fullmatch(r"[\s\d\-—/:：,.，、;；]*", s):
+        return ""
+    return s
+
+
 def apply_rule(raw: str, rule: dict) -> list:
     """用模型给出的参数生成拆好的数据列表。
 
@@ -433,9 +477,12 @@ def apply_rule(raw: str, rule: dict) -> list:
         # 一条记录内部若还有换行（如地址换行），拉平成空格，避免写进单元格带换行符
         rec = rec.replace("\r", " ").replace("\n", " ").strip()
         rec = re.sub(r"[ \t]{2,}", " ", rec)
-        if prefix_re:                      # 剔除开头的噪音（昵称/时间戳/序号等）
-            rec = prefix_re.sub("", rec, count=1).strip()
-            rec = re.sub(r"^[ \t，,;；、:：]+", "", rec)   # 剥完可能残留的分隔符
+        # 分列【之前】先剥前缀：模型给的正则 + 不依赖昵称的通用兜底。
+        # 必须在这剥，因为空格分列会把「第3条」和姓名切成两段，
+        # 拖到分列之后再剥就只剩个残渣字段，姓名反而丢了。
+        if prefix_re:
+            rec = prefix_re.sub("", rec, count=1)
+        rec = clean_name(rec)
         if not rec:
             continue
         row = _split_columns(rec, sep, cols)
