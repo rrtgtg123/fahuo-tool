@@ -122,6 +122,14 @@ class AIError(Exception):
     """AI 分词相关错误，message 已经是人话，可直接展示给用户。"""
 
 
+class AIConfigError(AIError):
+    """接口配置相关的错误（地址为空/格式错/认证失败/连不上）。
+
+    界面收到这类错误时会提示「AI 设置有误，请重新设置」并直接打开设置页，
+    而不是把 HTTP 状态码等技术细节抛给用户。
+    """
+
+
 # ---------------- 接口调用 ----------------
 def call_model(messages: list, base_url: str, api_key: str, model: str,
                timeout: int = REQUEST_TIMEOUT, response_format: bool = True) -> str:
@@ -131,13 +139,17 @@ def call_model(messages: list, base_url: str, api_key: str, model: str,
     """
     base_url = (base_url or "").strip().rstrip("/")
     if not base_url:
-        raise AIError("未配置接口地址。请点击『AI 设置』填写 OpenAI 兼容的接口地址（例如 "
-                      "https://api.deepseek.com/v1）。")
+        raise AIConfigError("还没填写 AI 接口地址。")
     if not (base_url.startswith("http://") or base_url.startswith("https://")):
-        raise AIError("接口地址格式不对，需要以 http:// 或 https:// 开头。")
+        raise AIConfigError("接口地址格式不对，需要以 http:// 或 https:// 开头。")
 
     url = base_url + "/chat/completions"
     payload = {"model": model or DEFAULT_MODEL, "messages": messages, "temperature": 0}
+    # 关闭思考链：拆分规则只需短 JSON，思考链既拖慢速度又易污染输出。
+    # 不同厂商参数名不一，常见的几个都带上（不认识的字段服务端通常会忽略）。
+    payload["enable_thinking"] = False      # 通义千问 / DashScope 系
+    payload["thinking"] = {"type": "disabled"}  # 部分 OpenAI 兼容端点
+    payload["chat_template_kwargs"] = {"enable_thinking": False}  # vLLM 系
     if response_format:
         payload["response_format"] = {"type": "json_object"}
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -157,29 +169,27 @@ def call_model(messages: list, base_url: str, api_key: str, model: str,
         except Exception:
             pass
         if e.code == 401:
-            raise AIError("接口认证失败（401）。请检查 API Key 是否正确、是否已过期。")
+            raise AIConfigError("API Key 不正确或已过期。")
         if e.code == 404:
-            raise AIError("接口地址不存在（404）。请确认地址是否为 ……/v1 形式，"
-                          "有些服务不需要 /v1 后缀。")
+            raise AIConfigError("接口地址不存在，请确认地址结尾是否为 ……/v1。")
         if e.code == 429:
-            raise AIError("请求过于频繁或额度不足（429）。稍后再试，或检查账户余额。")
-        # 502 / 503 / 504 多为网关或代理没连上真实端点
+            raise AIError("请求过于频繁或额度不足，请稍后再试或检查账户余额。")
+        # 502 / 503 / 504 多为网关或代理没连上真实端点 → 归为配置问题
         if e.code in (502, 503, 504):
-            raise AIError(f"连接不上接口（HTTP {e.code}）。请确认接口地址填写正确、"
-                          f"服务可访问；若走代理，检查代理是否拦截了该域名。")
+            raise AIConfigError("连接不上该接口，请检查接口地址是否正确、网络是否正常。")
         # 部分端点不支持 response_format，去掉后重试一次
         if response_format and e.code == 400:
             return call_model(messages, base_url, api_key, model, timeout, False)
-        raise AIError(f"接口返回错误（HTTP {e.code}）。{detail}")
+        raise AIConfigError("接口返回异常，请检查接口地址与模型名是否正确。")
     except urllib.error.URLError as e:
-        raise AIError(f"网络连接失败：{e.reason}。请检查接口地址是否可达、网络或代理是否正常。")
+        raise AIConfigError("连接不上该接口，请检查接口地址是否正确、网络是否正常。")
     except json.JSONDecodeError:
-        raise AIError("接口返回的不是合法 JSON，请确认该地址是 OpenAI 兼容的 chat 接口。")
+        raise AIConfigError("该地址返回的不是有效接口，请确认是 OpenAI 兼容地址。")
 
     try:
         return data["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError):
-        raise AIError(f"接口返回结构不符合 OpenAI 规范：{str(data)[:200]}")
+        raise AIConfigError("该地址返回的内容不符合接口规范，请检查接口地址与模型名。")
 
 
 def _extract_json(text: str) -> dict:

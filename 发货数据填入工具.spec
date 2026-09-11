@@ -7,7 +7,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],                  # 模板不再随 exe 打包，由用户自行选择
+    datas=[('app.ico', '.')],   # 应用图标随包分发（模板不打包，由用户自行选择）
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -25,6 +25,7 @@ exe = EXE(
     a.datas,
     [],
     name='发货数据填入工具',
+    icon='app.ico',            # exe 自身的图标（资源管理器 / 任务栏）
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
